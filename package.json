@@ -1,0 +1,73 @@
+{
+  "name": "fastify-agent-policy",
+  "version": "0.1.0",
+  "description": "Declare what an AI agent caller is allowed to do on a Fastify route, and deny it with machine-readable RFC 9457 problems.",
+  "keywords": [
+    "fastify",
+    "fastify-plugin",
+    "agent",
+    "ai-agent",
+    "policy",
+    "rfc9457",
+    "problem-details",
+    "web-bot-auth"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "postbuild": "npm run smoke",
+    "smoke": "node scripts/smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run typecheck",
+    "test": "node --import tsx --test test/*.test.ts",
+    "attw": "attw --pack .",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@fastify/error": "^4.0.0",
+    "fastify-plugin": "^5.0.1"
+  },
+  "peerDependencies": {
+    "fastify": "^5.0.0",
+    "fastify-web-bot-auth": "0.1.x"
+  },
+  "peerDependenciesMeta": {
+    "fastify-web-bot-auth": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.2",
+    "@types/node": "^22.15.3",
+    "fastify": "^5.3.2",
+    "tsdown": "^0.15.6",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  },
+  "author": "Umar Gora"
+}

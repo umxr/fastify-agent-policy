@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+_bmad/
+_bmad-output/
+.claude/
+fastify-agent-policy-brief.md
