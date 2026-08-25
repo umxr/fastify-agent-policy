@@ -5,6 +5,7 @@ import type {
   AgentPolicyDefaults,
   ConfirmMode,
   DryRunMode,
+  MaxRiskAllowance,
   ResolvedAgentPolicy,
   RiskTier,
   ScopeRequirement,
@@ -64,6 +65,23 @@ export const DuplicateRegistrationError = createError(
   500,
 )
 
+/**
+ * Thrown when the plugin is registered inside a scope that already has it
+ * from an ancestor.
+ *
+ * `fastify-plugin` skips encapsulation, so a nested registration's hooks are
+ * added to the same instance the ancestor's were: `identify()` and the whole
+ * check chain run twice per request, and a side-effecting guard -- the
+ * documented example is a spend counter -- charges twice. The nested
+ * registration's own `defaults` are ignored on top of that, because the
+ * ancestor's `onRoute` reaches each route first.
+ */
+export const NestedRegistrationError = createError(
+  'FST_AGENT_POLICY_NESTED_REGISTRATION',
+  'fastify-agent-policy is already registered on an enclosing Fastify instance. A nested registration would run identify() and every policy check twice per request -- double-charging any guard with a side effect -- and its own "defaults" would be silently ignored. Register it once at the level that owns the routes, or use sibling encapsulated scopes.',
+  500,
+)
+
 /** Thrown at request time when a resolver returns something that is not an identity. */
 export const InvalidAgentIdentityError = createError<[string]>(
   'FST_AGENT_POLICY_INVALID_IDENTITY',
@@ -80,7 +98,14 @@ export const POLICY_KEYS: readonly string[] = Object.freeze([
   'guard',
 ])
 
-const RISK_TIERS: readonly RiskTier[] = Object.freeze(['read', 'write', 'destructive'])
+/**
+ * Every risk tier, **in ascending order of damage**.
+ *
+ * The order is load-bearing, not cosmetic: `enforce.ts` derives the tier
+ * comparison from these positions, so reordering this array silently changes
+ * which routes an allowance permits. Append-only.
+ */
+export const RISK_TIERS: readonly RiskTier[] = Object.freeze(['read', 'write', 'destructive'])
 const DRY_RUN_MODES: readonly DryRunMode[] = Object.freeze([false, 'preview', 'handler'])
 const CONFIRM_MODES: readonly ConfirmMode[] = Object.freeze([false, 'two-phase'])
 
@@ -198,6 +223,47 @@ function validatePolicyShape(source: PolicySource, policy: unknown): AgentPolicy
 export function validateDefaults(defaults: unknown): AgentPolicyDefaults {
   if (defaults === undefined) return {}
   return validatePolicyShape(DEFAULTS_SOURCE, defaults)
+}
+
+/**
+ * Validates the plugin-level `maxRisk` map and returns a null-prototype copy.
+ *
+ * The copy matters at request time: a lookup on a plain object literal for an
+ * agent class named `constructor` or `toString` would find `Object.prototype`
+ * and read a function as a risk tier. With no prototype there is nothing to
+ * find, so an unlisted class always falls through to `default`.
+ */
+export function validateMaxRisk(maxRisk: unknown): MaxRiskAllowance | undefined {
+  if (maxRisk === undefined) return undefined
+  if (!isPlainObject(maxRisk)) {
+    throw new InvalidAgentPolicyOptionsError(
+      `"maxRisk" must be an object mapping an agent class to a risk tier (one of ${quoteList(RISK_TIERS)})`,
+    )
+  }
+
+  // `{}` matches no class and has no `default`, so every agent on every
+  // policed route is denied. It reads as "no restrictions configured" and
+  // behaves as "deny all"; neither reading should be reachable by accident.
+  if (Object.keys(maxRisk).length === 0) {
+    throw new InvalidAgentPolicyOptionsError(
+      '"maxRisk" must name at least one agent class. An empty map denies every agent on every policed route -- omit the option entirely to disable the risk tier check.',
+    )
+  }
+
+  const allowance = Object.create(null) as Record<string, RiskTier>
+  for (const [agentClass, tier] of Object.entries(maxRisk)) {
+    if (agentClass.length === 0) {
+      throw new InvalidAgentPolicyOptionsError('"maxRisk" keys must be non-empty agent class names')
+    }
+    if (!RISK_TIERS.includes(tier as RiskTier)) {
+      throw new InvalidAgentPolicyOptionsError(
+        `"maxRisk.${agentClass}" must be one of ${quoteList(RISK_TIERS)}`,
+      )
+    }
+    allowance[agentClass] = tier as RiskTier
+  }
+
+  return Object.freeze(allowance)
 }
 
 /**

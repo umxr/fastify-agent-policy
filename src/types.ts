@@ -18,7 +18,7 @@ export type RiskTier = 'read' | 'write' | 'destructive'
 export interface AgentIdentity {
   /** Stable identifier for the caller, e.g. a normalized https origin. */
   id: string
-  /** Scopes the caller presented. Used by scope enforcement (deferred). */
+  /** Scopes the caller presented. Matched by exact string equality. */
   scopes?: string[]
   /**
    * Trust class of the identity. The built-in resolvers emit
@@ -78,9 +78,9 @@ export interface AgentPolicy {
   dryRun?: DryRunMode
   /** Two-phase confirmation. Declared now; enforced by a later goal. */
   confirm?: ConfirmMode
-  /** Scopes the agent must hold. Declared now; enforced by a later goal. */
+  /** Scopes the agent must hold. Matched by exact string equality. */
   scopes?: ScopeRequirement
-  /** Custom predicate. Declared now; enforced by a later goal. */
+  /** Custom predicate. Runs last, only for an identified agent. */
   guard?: AgentGuard
 }
 
@@ -94,6 +94,28 @@ export type AgentPolicyDefaults = AgentPolicy
 export interface ResolvedAgentPolicy extends AgentPolicy {
   risk: RiskTier
 }
+
+/**
+ * The highest {@link RiskTier} each agent class may call.
+ *
+ * Keys are `AgentIdentity.class` values. Tiers compare in ascending order of
+ * damage -- `read` < `write` < `destructive` -- and an allowance is inclusive.
+ *
+ * ```ts
+ * maxRisk: { trusted: 'destructive', verified: 'write', default: 'read' }
+ * ```
+ *
+ * `default` is **reserved**: it is the allowance for every class the map does
+ * not list, so an agent class literally named `default` silently takes the
+ * fallback and cannot be given an entry of its own. Rename the class if your
+ * resolver can emit it.
+ *
+ * Without a `default`, an unlisted class is denied -- as is an identity
+ * carrying no `class` at all. An empty map is rejected at registration: it
+ * denies everything while reading as "nothing configured". Leave the option
+ * unset to disable the tier check entirely.
+ */
+export type MaxRiskAllowance = Record<string, RiskTier>
 
 /** Who the policy applies to. */
 export type ApplyTo = 'agents' | 'all'
@@ -131,6 +153,14 @@ export interface AgentPolicyOptions {
   applyTo?: ApplyTo
   /** Policy members every route inherits unless it overrides them. */
   defaults?: AgentPolicyDefaults
+  /**
+   * The highest risk tier each agent class may call, keyed by
+   * `AgentIdentity.class` with a `default` fallback.
+   *
+   * Unset -- the default -- skips the tier check; scopes and guards still
+   * run. Set it, and a class with no entry and no `default` is denied.
+   */
+  maxRisk?: MaxRiskAllowance
   /**
    * Base URI the RFC 9457 `type` slugs hang off. It identifies the problem
    * type; it does not have to be dereferenceable, but it must parse as a URI:

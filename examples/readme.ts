@@ -36,6 +36,13 @@ await app.register(agentPolicy, {
   applyTo: 'agents',
   // Every route inherits these unless it says otherwise.
   defaults: { risk: 'write' },
+  // The highest risk tier each agent class may call. Leave it out and the
+  // tier check is skipped; scopes and guards still run.
+  maxRisk: {
+    trusted: 'destructive',
+    verified: 'write',
+    default: 'read',
+  },
   problemBaseUri: 'https://api.example/problems',
   wwwAuthenticate: 'Signature realm="bots"',
   // 'strict' is the default; 'warn' and 'off' reopen the

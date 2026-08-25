@@ -122,6 +122,70 @@ test('encapsulated sibling scopes each get their own registration', async () => 
   await app.close()
 })
 
+test('nested registration rejects: an enclosing scope already has the plugin', async () => {
+  const app = Fastify()
+  app.register(agentPolicy, { identify })
+  app.register(async (child) => {
+    // `fastify-plugin` skips encapsulation, so this would join the root's
+    // hooks rather than replace them.
+    await child.register(agentPolicy, { identify, defaults: { risk: 'read' } })
+    child.get('/child', { config: { agent: { risk: 'read' } } }, async () => ({ ok: true }))
+  })
+
+  const error = await rejectionOf(app)
+  assert.equal(
+    (error as Error & { code?: string }).code,
+    'FST_AGENT_POLICY_NESTED_REGISTRATION',
+  )
+  assert.match(error.message, /already registered on an enclosing/)
+})
+
+test('nesting is rejected rather than running a side-effecting guard twice', async () => {
+  // The measured failure this rule exists for: with both registrations live,
+  // the guard ran twice per request, so the documented spend-counter example
+  // double-charged. Boot must stop before a request can prove it.
+  let guardRuns = 0
+  const app = Fastify()
+  app.register(agentPolicy, { identify: () => ({ id: 'https://agent.example' }) })
+  app.register(async (child) => {
+    await child.register(agentPolicy, { identify: () => ({ id: 'https://agent.example' }) })
+    child.get(
+      '/spend',
+      {
+        config: {
+          agent: {
+            risk: 'write',
+            guard: () => {
+              guardRuns += 1
+              return true
+            },
+          },
+        },
+      },
+      async () => ({ ok: true }),
+    )
+  })
+
+  await rejectionOf(app)
+  assert.equal(guardRuns, 0, 'no request was ever served')
+})
+
+test('a deeply nested registration is rejected too', async () => {
+  const app = Fastify()
+  app.register(agentPolicy, { identify })
+  app.register(async (middle) => {
+    await middle.register(async (inner) => {
+      await inner.register(agentPolicy, { identify })
+    })
+  })
+
+  const error = await rejectionOf(app)
+  assert.equal(
+    (error as Error & { code?: string }).code,
+    'FST_AGENT_POLICY_NESTED_REGISTRATION',
+  )
+})
+
 test('problemBaseUri must parse as a URI', async () => {
   for (const bad of ['not a uri', '/problems', '', '  ']) {
     const app = Fastify()

@@ -9,6 +9,7 @@ export {
   InvalidAgentPolicyError,
   InvalidAgentPolicyOptionsError,
   MissingRiskTierError,
+  NestedRegistrationError,
   RoutesBeforePluginError,
   validatePolicy,
 } from './policy.js'
@@ -59,6 +60,7 @@ export type {
   ConfirmMode,
   DryRunMode,
   GuardResult,
+  MaxRiskAllowance,
   RegistrationOrder,
   ResolvedAgentPolicy,
   RiskTier,

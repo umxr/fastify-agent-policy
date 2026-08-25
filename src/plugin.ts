@@ -5,11 +5,20 @@ import {
   DuplicateRegistrationError,
   InvalidAgentIdentityError,
   InvalidAgentPolicyOptionsError,
+  NestedRegistrationError,
   RoutesBeforePluginError,
   formatRouteName,
   validateDefaults,
+  validateMaxRisk,
   validatePolicy,
 } from './policy.js'
+import {
+  checkGuard,
+  evaluateGate,
+  normalizeScopeRequirement,
+  type Denial,
+  type ScopeCheck,
+} from './enforce.js'
 import {
   DEFAULT_PROBLEM_BASE_URI,
   DEFAULT_WWW_AUTHENTICATE,
@@ -26,8 +35,11 @@ import type {
   ResolvedAgentPolicy,
 } from './types.js'
 
-interface NormalizedOptions extends Required<Omit<AgentPolicyOptions, 'defaults'>> {
+interface NormalizedOptions
+  extends Required<Omit<AgentPolicyOptions, 'defaults' | 'maxRisk'>> {
   defaults: AgentPolicyOptions['defaults']
+  /** Absent means the tier check is disabled, so it stays optional here. */
+  maxRisk: AgentPolicyOptions['maxRisk']
 }
 
 /**
@@ -42,14 +54,41 @@ interface NormalizedOptions extends Required<Omit<AgentPolicyOptions, 'defaults'
  */
 const kResolvedPolicy = Symbol('fastify-agent-policy.resolvedPolicy')
 
+/**
+ * Where the route's `scopes` requirement is parked, already reduced to one
+ * shape.
+ *
+ * It rides on `config` beside {@link kResolvedPolicy} rather than becoming a
+ * member of `ResolvedAgentPolicy`, which is exported: a required member there
+ * would be a breaking change for anyone who builds one by hand, and an
+ * optional one would still publish an internal shape as a promise.
+ */
+const kScopeCheck = Symbol('fastify-agent-policy.scopeCheck')
+
 /** A route `config` after `onRoute` has validated its policy. */
 interface PolicedConfig {
   [kResolvedPolicy]?: ResolvedAgentPolicy
+  [kScopeCheck]?: ScopeCheck | null
   agent?: unknown
 }
 
 /** What `printRoutes()` returns when the router is empty. */
 const EMPTY_ROUTE_TREE = '(empty tree)'
+
+/**
+ * The `detail` sent when a policed route cannot be given an identity.
+ *
+ * Held here rather than inline at the two call sites: they are published
+ * response bodies, and two copies of a published string is one copy that can
+ * drift.
+ */
+const IDENTITY_DETAIL = Object.freeze({
+  /** `identify()` threw. Transient, so the caller is told to retry. */
+  unavailable: 'The agent identity could not be resolved right now. Retry the request.',
+  /** `identify()` returned `null` under `applyTo: 'all'`. */
+  missing:
+    'This route requires an identified agent caller. Present agent credentials your identify() resolver recognizes.',
+})
 
 const REGISTRATION_ORDERS: readonly RegistrationOrder[] = Object.freeze([
   'strict',
@@ -110,6 +149,7 @@ function normalizeOptions(options: AgentPolicyOptions): NormalizedOptions {
     wwwAuthenticate,
     registrationOrder: registrationOrder as RegistrationOrder,
     defaults: validateDefaults(options.defaults),
+    maxRisk: validateMaxRisk(options.maxRisk),
   }
 }
 
@@ -165,6 +205,15 @@ const agentPolicy: FastifyPluginAsync<AgentPolicyOptions> = async (fastify, opts
     throw new DuplicateRegistrationError()
   }
 
+  // Inherited, not own: an enclosing scope already registered. `fastify-plugin`
+  // skips the encapsulation override, so this registration's hooks would join
+  // the ancestor's on the same instance and every check would run twice --
+  // including a guard with a side effect. Sibling scopes are unaffected: their
+  // shared ancestor is the bare root, which carries no state.
+  if (kAgentPolicyState in fastify) {
+    throw new NestedRegistrationError()
+  }
+
   const options = normalizeOptions(opts)
 
   attachState(fastify, {
@@ -205,7 +254,13 @@ const agentPolicy: FastifyPluginAsync<AgentPolicyOptions> = async (fastify, opts
     if (config[kResolvedPolicy] !== undefined) return
 
     const routeName = formatRouteName(routeOptions.method, routeOptions.url)
-    config[kResolvedPolicy] = validatePolicy(routeName, declared, options.defaults)
+    const resolved = validatePolicy(routeName, declared, options.defaults)
+    config[kResolvedPolicy] = resolved
+
+    // `validatePolicy` returns the user's union unchanged -- it is a published
+    // return type. Reducing it here means the request path never re-branches
+    // on the shape a route happened to declare.
+    config[kScopeCheck] = normalizeScopeRequirement(resolved.scopes)
   })
 
   if (routesBeforePlugin !== null) {
@@ -224,11 +279,12 @@ const agentPolicy: FastifyPluginAsync<AgentPolicyOptions> = async (fastify, opts
     })
   }
 
-  // Identity resolution and the denial run in `onRequest`, the first hook in
-  // the lifecycle. In `preHandler` they would run after body parsing and
-  // schema validation, so an unidentified caller with a malformed body would
-  // get Fastify's `400 FST_ERR_VALIDATION` in `application/json` instead of
-  // the problem document.
+  // Identity resolution and the declarative checks run in `onRequest`, the
+  // first hook in the lifecycle. In `preHandler` they would run after body
+  // parsing and schema validation, so an unidentified caller with a malformed
+  // body would get Fastify's `400 FST_ERR_VALIDATION` in `application/json`
+  // instead of the problem document. The guard is the deliberate exception --
+  // see the `preHandler` hook below.
   fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
     // `request.routeOptions.config` is shared across every request on this
     // route. Read it; never write to it.
@@ -249,7 +305,12 @@ const agentPolicy: FastifyPluginAsync<AgentPolicyOptions> = async (fastify, opts
       // fails closed: its policy cannot be honoured without an identity.
       if (policy === undefined) return
 
-      return deny(request, reply, 'identify() failed', true)
+      return deny(request, reply, {
+        kind: 'agent_identity_required',
+        reason: 'identify() failed',
+        detail: IDENTITY_DETAIL.unavailable,
+        retryable: true,
+      })
     }
 
     // A resolver returning a malformed identity is a programming error, not a
@@ -257,25 +318,106 @@ const agentPolicy: FastifyPluginAsync<AgentPolicyOptions> = async (fastify, opts
     request.agent = normalizeIdentity(resolved)
 
     if (policy === undefined) return
-    if (request.agent !== null) return
-    if (options.applyTo !== 'all') return
 
-    return deny(request, reply, 'no agent identity resolved', false)
+    if (request.agent === null) {
+      // `applyTo: 'agents'` is the default and means exactly this: traffic
+      // with no agent identity is human traffic, and none of the checks
+      // below have anything to decide about it.
+      if (options.applyTo !== 'all') return
+
+      return deny(request, reply, {
+        kind: 'agent_identity_required',
+        reason: 'no agent identity resolved',
+        detail: IDENTITY_DETAIL.missing,
+        retryable: false,
+      })
+    }
+
+    // From here there is an identity, so the declared policy finally has
+    // something to be enforced against. Risk, then scopes; the guard follows
+    // in `preHandler`.
+    const denial = evaluateGate(
+      request.agent,
+      policy,
+      scopeCheckFor(request, config, policy),
+      options.maxRisk,
+    )
+    if (denial === null) return
+
+    return deny(request, reply, denial)
   })
 
-  function deny(
+  // The guard runs here, not in `onRequest`, because a guard exists to inspect
+  // the request and `request.body` is not parsed until after `onRequest`. A
+  // guard reading `request.body.amount` in `onRequest` sees `undefined` and
+  // refuses every valid call. The cost is that a body failing schema
+  // validation gets Fastify's `400` before the guard is consulted at all.
+  //
+  // Risk and scopes have already passed by the time this runs: a denial from
+  // `onRequest` ends the lifecycle, so the fixed risk-scopes-guard order and
+  // its short-circuit survive the split across two hooks.
+  fastify.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
+    const config = request.routeOptions.config as PolicedConfig | undefined
+    const policy = config?.[kResolvedPolicy]
+
+    if (policy === undefined || policy.guard === undefined) return
+
+    // The same rule the other hook keeps: no identity means human traffic
+    // under `applyTo: 'agents'`, and under `'all'` the request was already
+    // denied in `onRequest` and never reached here.
+    if (request.agent === null) return
+
+    const denial = await checkGuard(request, request.agent, policy.guard)
+    if (denial === null) return
+
+    return deny(request, reply, denial)
+  })
+
+  /**
+   * The route's precomputed scope requirement.
+   *
+   * `onRoute` writes {@link kScopeCheck} and {@link kResolvedPolicy} together,
+   * so a resolved policy with no scope check is an internal fault -- and the
+   * one place this module could fail *open*, because an absent check would
+   * otherwise read as "this route requires no scopes" and wave through exactly
+   * the caller the route meant to stop. `null` is a real answer (the route
+   * declares no scopes) and `undefined` is the fault, so the two are
+   * distinguished rather than collapsed with `??`. The requirement is
+   * re-derived from the policy rather than trusted away.
+   */
+  function scopeCheckFor(
     request: FastifyRequest,
-    reply: FastifyReply,
-    reason: string,
-    retryable: boolean,
-  ): FastifyReply {
+    config: PolicedConfig | undefined,
+    policy: ResolvedAgentPolicy,
+  ): ScopeCheck | null {
+    const precomputed = config?.[kScopeCheck]
+    if (precomputed !== undefined) return precomputed
+
+    request.log.warn(
+      { agentPolicy: { fault: 'missing-scope-check', method: request.method, url: request.url } },
+      'fastify-agent-policy: the precomputed scope requirement was missing; re-deriving it from the route policy',
+    )
+    return normalizeScopeRequirement(policy.scopes)
+  }
+
+  /**
+   * Logs one denial and sends its problem document.
+   *
+   * `denial.reason` is for the operator and stays in the log; `denial.detail`
+   * is the only explanation the caller sees. A guard's thrown message and the
+   * configured `maxRisk` allowance therefore never reach the response body.
+   *
+   * The denial is sent, never thrown: a host application's root
+   * `setErrorHandler` would otherwise rewrite the body agents read.
+   */
+  function deny(request: FastifyRequest, reply: FastifyReply, denial: Denial): FastifyReply {
     request.log.warn(
       {
         agentPolicy: {
           decision: 'denied',
-          problem: 'agent_identity_required',
-          reason,
-          retryable,
+          problem: denial.kind,
+          reason: denial.reason,
+          retryable: denial.retryable,
           agent: request.agent?.id ?? null,
           method: request.method,
           url: request.url,
@@ -284,11 +426,10 @@ const agentPolicy: FastifyPluginAsync<AgentPolicyOptions> = async (fastify, opts
       'fastify-agent-policy denied the request',
     )
 
-    return sendProblem(reply, 'agent_identity_required', {
-      retryable,
-      detail: retryable
-        ? 'The agent identity could not be resolved right now. Retry the request.'
-        : 'This route requires an identified agent caller. Present agent credentials your identify() resolver recognizes.',
+    return sendProblem(reply, denial.kind, {
+      ...denial.extensions,
+      retryable: denial.retryable,
+      detail: denial.detail,
     })
   }
 }
