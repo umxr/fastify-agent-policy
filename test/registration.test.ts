@@ -3,7 +3,11 @@ import test from 'node:test'
 
 import Fastify, { type FastifyInstance } from 'fastify'
 
-import agentPolicy, { type AgentPolicy } from '../src/index.ts'
+import agentPolicy, {
+  type AgentPolicy,
+  type AgentPolicyOptions,
+  type MaxRiskAllowance,
+} from '../src/index.ts'
 
 const identify = () => null
 
@@ -167,19 +171,33 @@ test('Fastify-injected url and method config keys are tolerated', async () => {
 })
 
 test('invalid plugin options reject at registration', async () => {
-  const cases: Array<[Record<string, unknown>, RegExp]> = [
+  // Deliberately malformed, so the values cannot satisfy `AgentPolicyOptions`.
+  // Each case is still typed as an options-shaped object: `as never` would
+  // erase the argument type entirely and hide a case that stopped meaning
+  // what it says.
+  type MalformedOptions = Partial<Record<keyof AgentPolicyOptions, unknown>>
+  const cases: Array<[MalformedOptions, RegExp]> = [
     [{}, /"identify" is required/],
     [{ identify, applyTo: 'humans' }, /"applyTo" must be/],
     [{ identify, problemBaseUri: '' }, /"problemBaseUri" must be/],
     [{ identify, defaults: { risk: 'nuclear' } }, /"defaults" -- "risk" must be one of/],
     [{ identify, defaults: { nope: 1 } }, /"defaults" -- unknown property "nope"/],
+    [{ identify, maxRisk: { verified: 'nuclear' } }, /"maxRisk.verified" must be one of/],
+    [{ identify, maxRisk: { trusted: 'write', default: true } }, /"maxRisk.default" must be one of/],
+    [{ identify, maxRisk: 'write' }, /"maxRisk" must be an object/],
+    [{ identify, maxRisk: ['write'] }, /"maxRisk" must be an object/],
+    [{ identify, maxRisk: null }, /"maxRisk" must be an object/],
+    [{ identify, maxRisk: { '': 'write' } }, /"maxRisk" keys must be non-empty/],
+    // An empty map matches no class and has no `default`, so it denies every
+    // agent on every policed route while reading as "nothing configured".
+    [{ identify, maxRisk: {} }, /"maxRisk" must name at least one agent class/],
   ]
 
   for (const [options, expected] of cases) {
     const app = Fastify()
     await assert.rejects(
       async () => {
-        await app.register(agentPolicy, options as never)
+        await app.register(agentPolicy, options as unknown as AgentPolicyOptions)
         await app.ready()
       },
       (error: Error) => {
@@ -189,6 +207,53 @@ test('invalid plugin options reject at registration', async () => {
     )
     await app.close()
   }
+})
+
+test('a non-empty maxRisk map registers and takes effect at request time', async () => {
+  const maxRisk: MaxRiskAllowance = { trusted: 'destructive', verified: 'write', default: 'read' }
+
+  const app = Fastify()
+  await app.register(agentPolicy, {
+    identify: (request) => ({
+      id: 'https://agent.example',
+      class: String(request.headers['x-agent-class'] ?? 'verified'),
+    }),
+    maxRisk,
+  })
+  app.get('/reports', { config: { agent: { risk: 'read' } } }, async () => ({ ok: true }))
+  app.delete('/reports', { config: { agent: { risk: 'destructive' } } }, async () => ({ ok: true }))
+  await app.ready()
+
+  const read = await app.inject({ method: 'GET', url: '/reports' })
+  assert.equal(read.statusCode, 200, 'a read is within the verified allowance')
+
+  const destructive = await app.inject({ method: 'DELETE', url: '/reports' })
+  assert.equal(destructive.statusCode, 403, 'a destructive route is not')
+  assert.equal(
+    destructive.json().type,
+    'https://github.com/umxr/fastify-agent-policy/problems/risk_tier_blocked',
+  )
+
+  const trusted = await app.inject({
+    method: 'DELETE',
+    url: '/reports',
+    headers: { 'x-agent-class': 'trusted' },
+  })
+  assert.equal(trusted.statusCode, 200, 'trusted may call anything')
+
+  await app.close()
+})
+
+test('maxRisk is optional: omitting it skips the tier check', async () => {
+  const app = Fastify()
+  await app.register(agentPolicy, {
+    identify: () => ({ id: 'https://agent.example', class: 'nothing-configured' }),
+  })
+  app.delete('/reports', { config: { agent: { risk: 'destructive' } } }, async () => ({ ok: true }))
+  await app.ready()
+
+  assert.equal((await app.inject({ method: 'DELETE', url: '/reports' })).statusCode, 200)
+  await app.close()
 })
 
 test('a route without config.agent is never validated', async () => {
